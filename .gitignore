@@ -1,0 +1,40 @@
+# Data artifacts
+/data/
+/runs/
+/runs_push/
+/submissions/
+submission.csv
+submission_*.csv
+submission_comma.csv
+catboost_info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.venv*/
+.env
+
+# Tool caches
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build outputs
+build/
+dist/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Misc
+*.log
+*.tmp
+*.swp
