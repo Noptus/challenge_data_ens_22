@@ -14,7 +14,7 @@ import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -24,10 +24,71 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 
+def stabilize_pred(pred: np.ndarray, min_value: float = 1e-6, max_value: float = 1e6) -> np.ndarray:
+    arr = np.asarray(pred, dtype=float)
+    arr = np.nan_to_num(arr, nan=min_value, posinf=max_value, neginf=min_value)
+    return np.clip(arr, min_value, max_value)
+
+
+def expm1_safe(pred_log: np.ndarray, log_clip: float = 20.0) -> np.ndarray:
+    arr = np.asarray(pred_log, dtype=float)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=log_clip, neginf=-log_clip)
+    arr = np.clip(arr, -log_clip, log_clip)
+    return stabilize_pred(np.expm1(arr))
+
+
 def safe_mape(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-6) -> float:
-    y_true = np.maximum(y_true, eps)
-    y_pred = np.maximum(y_pred, eps)
+    y_true = stabilize_pred(y_true, min_value=eps, max_value=1e9)
+    y_pred = stabilize_pred(y_pred, min_value=eps, max_value=1e9)
     return float(np.mean(np.abs(y_true - y_pred) / y_true))
+
+
+def format_seconds(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+@dataclass
+class ProgressLogger:
+    run_start_ts: float
+    time_budget_min: int
+    enabled: bool = True
+
+    def elapsed_sec(self) -> float:
+        return time.time() - self.run_start_ts
+
+    def budget_left_min(self) -> float:
+        return max(0.0, float(self.time_budget_min) - (self.elapsed_sec() / 60.0))
+
+    def log(self, message: str) -> None:
+        if not self.enabled:
+            return
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"[{ts}] {message}", flush=True)
+
+    def log_fold(
+        self,
+        model_name: str,
+        fold_idx: int,
+        n_folds: int,
+        fold_sec: float,
+        fold_mape: float,
+        avg_fold_sec: float,
+    ) -> None:
+        eta_model = avg_fold_sec * max(0, n_folds - fold_idx - 1)
+        self.log(
+            f"{model_name} fold {fold_idx + 1}/{n_folds} "
+            f"mape={fold_mape:.6f} "
+            f"fold={format_seconds(fold_sec)} "
+            f"model_eta~{format_seconds(eta_model)} "
+            f"elapsed={format_seconds(self.elapsed_sec())} "
+            f"budget_left~{self.budget_left_min():.1f}m"
+        )
 
 
 def timestamp_tag() -> str:
@@ -338,12 +399,19 @@ def train_ridge_oof(
     n_splits: int,
     seed: int,
     alpha: float,
+    progress: Optional[ProgressLogger] = None,
 ) -> ModelResult:
     folds = _folds(groups, n_splits)
     oof = np.zeros(len(y), dtype=float)
     mapes: List[float] = []
+    fold_times: List[float] = []
+    t_model = time.time()
 
-    for tr_idx, va_idx in folds:
+    if progress:
+        progress.log(f"{name}: start OOF ({len(folds)} folds, rows={len(y)}, features={X.shape[1]})")
+
+    for fold_idx, (tr_idx, va_idx) in enumerate(folds):
+        t_fold = time.time()
         model = Pipeline(
             steps=[
                 ("scaler", StandardScaler()),
@@ -354,10 +422,20 @@ def train_ridge_oof(
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=RuntimeWarning)
             model.fit(X.iloc[tr_idx], np.log1p(y[tr_idx]), ridge__sample_weight=sw)
-            pred = np.expm1(model.predict(X.iloc[va_idx]))
-        pred = np.maximum(pred, 1e-6)
+            pred = expm1_safe(model.predict(X.iloc[va_idx]))
         oof[va_idx] = pred
-        mapes.append(safe_mape(y[va_idx], pred))
+        fold_mape = safe_mape(y[va_idx], pred)
+        mapes.append(fold_mape)
+        fold_sec = time.time() - t_fold
+        fold_times.append(fold_sec)
+        if progress:
+            progress.log_fold(name, fold_idx, len(folds), fold_sec, fold_mape, float(np.mean(fold_times)))
+
+    if progress:
+        progress.log(
+            f"{name}: done mean_mape={float(np.mean(mapes)):.6f} "
+            f"total={format_seconds(time.time() - t_model)}"
+        )
 
     return ModelResult(
         name=name,
@@ -376,6 +454,7 @@ def train_lgbm_oof(
     groups: np.ndarray,
     n_splits: int,
     seed: int,
+    progress: Optional[ProgressLogger] = None,
 ) -> ModelResult:
     import lightgbm as lgb
 
@@ -383,6 +462,8 @@ def train_lgbm_oof(
     oof = np.zeros(len(y), dtype=float)
     mapes: List[float] = []
     best_iters: List[int] = []
+    fold_times: List[float] = []
+    t_model = time.time()
 
     params = {
         "objective": "regression_l1",
@@ -398,7 +479,11 @@ def train_lgbm_oof(
         "seed": seed,
     }
 
-    for tr_idx, va_idx in folds:
+    if progress:
+        progress.log(f"M3_lgbm_l1: start OOF ({len(folds)} folds, rows={len(y)}, features={X.shape[1]})")
+
+    for fold_idx, (tr_idx, va_idx) in enumerate(folds):
+        t_fold = time.time()
         model = lgb.LGBMRegressor(**params)
         model.fit(
             X.iloc[tr_idx],
@@ -406,17 +491,28 @@ def train_lgbm_oof(
             eval_set=[(X.iloc[va_idx], np.log1p(y[va_idx]))],
             eval_metric=lambda yt, yp: (
                 "mape",
-                safe_mape(np.expm1(yt), np.expm1(yp)),
+                safe_mape(expm1_safe(yt), expm1_safe(yp)),
                 False,
             ),
             callbacks=[lgb.early_stopping(300, verbose=False)],
         )
         best_iter = int(model.best_iteration_ or params["n_estimators"])
-        pred = np.expm1(model.predict(X.iloc[va_idx], num_iteration=best_iter))
-        pred = np.maximum(pred, 1e-6)
+        pred = expm1_safe(model.predict(X.iloc[va_idx], num_iteration=best_iter))
         oof[va_idx] = pred
-        mapes.append(safe_mape(y[va_idx], pred))
+        fold_mape = safe_mape(y[va_idx], pred)
+        mapes.append(fold_mape)
         best_iters.append(best_iter)
+        fold_sec = time.time() - t_fold
+        fold_times.append(fold_sec)
+        if progress:
+            progress.log_fold("M3_lgbm_l1", fold_idx, len(folds), fold_sec, fold_mape, float(np.mean(fold_times)))
+
+    if progress:
+        progress.log(
+            f"M3_lgbm_l1: done mean_mape={float(np.mean(mapes)):.6f} "
+            f"median_best_iter={int(np.median(best_iters)) if best_iters else 0} "
+            f"total={format_seconds(time.time() - t_model)}"
+        )
 
     return ModelResult(
         name="M3_lgbm_l1",
@@ -435,6 +531,7 @@ def train_xgb_oof(
     groups: np.ndarray,
     n_splits: int,
     seed: int,
+    progress: Optional[ProgressLogger] = None,
 ) -> ModelResult:
     import xgboost as xgb
 
@@ -442,6 +539,8 @@ def train_xgb_oof(
     oof = np.zeros(len(y), dtype=float)
     mapes: List[float] = []
     best_iters: List[int] = []
+    fold_times: List[float] = []
+    t_model = time.time()
 
     params = {
         "objective": "reg:squarederror",
@@ -454,7 +553,11 @@ def train_xgb_oof(
         "seed": seed,
     }
 
-    for tr_idx, va_idx in folds:
+    if progress:
+        progress.log(f"M4_xgb: start OOF ({len(folds)} folds, rows={len(y)}, features={X.shape[1]})")
+
+    for fold_idx, (tr_idx, va_idx) in enumerate(folds):
+        t_fold = time.time()
         dtr = xgb.DMatrix(X.iloc[tr_idx], label=np.log1p(y[tr_idx]))
         dva = xgb.DMatrix(X.iloc[va_idx], label=np.log1p(y[va_idx]))
         model = xgb.train(
@@ -466,11 +569,22 @@ def train_xgb_oof(
             verbose_eval=False,
         )
         best_iter = int(model.best_iteration + 1)
-        pred = np.expm1(model.predict(dva, iteration_range=(0, best_iter)))
-        pred = np.maximum(pred, 1e-6)
+        pred = expm1_safe(model.predict(dva, iteration_range=(0, best_iter)))
         oof[va_idx] = pred
-        mapes.append(safe_mape(y[va_idx], pred))
+        fold_mape = safe_mape(y[va_idx], pred)
+        mapes.append(fold_mape)
         best_iters.append(best_iter)
+        fold_sec = time.time() - t_fold
+        fold_times.append(fold_sec)
+        if progress:
+            progress.log_fold("M4_xgb", fold_idx, len(folds), fold_sec, fold_mape, float(np.mean(fold_times)))
+
+    if progress:
+        progress.log(
+            f"M4_xgb: done mean_mape={float(np.mean(mapes)):.6f} "
+            f"median_best_iter={int(np.median(best_iters)) if best_iters else 0} "
+            f"total={format_seconds(time.time() - t_model)}"
+        )
 
     return ModelResult(
         name="M4_xgb",
@@ -489,6 +603,7 @@ def train_cat_oof(
     groups: np.ndarray,
     n_splits: int,
     seed: int,
+    progress: Optional[ProgressLogger] = None,
 ) -> ModelResult:
     from catboost import CatBoostRegressor
 
@@ -496,6 +611,8 @@ def train_cat_oof(
     oof = np.zeros(len(y), dtype=float)
     mapes: List[float] = []
     best_iters: List[int] = []
+    fold_times: List[float] = []
+    t_model = time.time()
 
     params = {
         "loss_function": "MAPE",
@@ -516,7 +633,11 @@ def train_cat_oof(
     if "product_id" in X.columns:
         cat_cols.append("product_id")
 
-    for tr_idx, va_idx in folds:
+    if progress:
+        progress.log(f"M5_cat: start OOF ({len(folds)} folds, rows={len(y)}, features={X.shape[1]})")
+
+    for fold_idx, (tr_idx, va_idx) in enumerate(folds):
+        t_fold = time.time()
         model = CatBoostRegressor(**params)
         model.fit(
             X.iloc[tr_idx],
@@ -528,8 +649,20 @@ def train_cat_oof(
         pred = model.predict(X.iloc[va_idx])
         pred = np.maximum(pred, 1e-6)
         oof[va_idx] = pred
-        mapes.append(safe_mape(y[va_idx], pred))
+        fold_mape = safe_mape(y[va_idx], pred)
+        mapes.append(fold_mape)
         best_iters.append(int(model.get_best_iteration() or params["iterations"]))
+        fold_sec = time.time() - t_fold
+        fold_times.append(fold_sec)
+        if progress:
+            progress.log_fold("M5_cat", fold_idx, len(folds), fold_sec, fold_mape, float(np.mean(fold_times)))
+
+    if progress:
+        progress.log(
+            f"M5_cat: done mean_mape={float(np.mean(mapes)):.6f} "
+            f"median_best_iter={int(np.median(best_iters)) if best_iters else 0} "
+            f"total={format_seconds(time.time() - t_model)}"
+        )
 
     return ModelResult(
         name="M5_cat",
@@ -580,7 +713,7 @@ def blend_score(
     y: np.ndarray,
     sample_idx: np.ndarray | None = None,
 ) -> float:
-    pred = preds_matrix @ weights
+    pred = stabilize_pred(preds_matrix @ weights)
     if sample_idx is not None:
         return safe_mape(y[sample_idx], pred[sample_idx])
     return safe_mape(y, pred)
@@ -627,6 +760,7 @@ def fit_blend(
     oof_dict: Dict[str, np.ndarray],
     y: np.ndarray,
     seed: int,
+    progress: Optional[ProgressLogger] = None,
 ) -> Tuple[np.ndarray, float, pd.DataFrame]:
     if len(model_names) == 1:
         weights = np.array([1.0])
@@ -649,10 +783,20 @@ def fit_blend(
 
     records = []
     coarse: List[Tuple[np.ndarray, float]] = []
+    coarse_best = float("inf")
+    total_coarse = math.comb(int(round(1.0 / 0.05)) + len(model_names) - 1, len(model_names) - 1)
+    t_coarse = time.time()
 
-    for w in generate_simplex_weights(len(model_names), step=0.05):
+    if progress:
+        progress.log(
+            f"Blend {blend_name}: start coarse search "
+            f"(models={model_names}, candidates={total_coarse})"
+        )
+
+    for idx, w in enumerate(generate_simplex_weights(len(model_names), step=0.05), start=1):
         s = blend_score(preds, w, y, sample_idx=sample_idx)
         coarse.append((w, s))
+        coarse_best = min(coarse_best, s)
         records.append(
             {
                 "blend_name": blend_name,
@@ -661,6 +805,13 @@ def fit_blend(
                 "weights_json": json.dumps({m: float(x) for m, x in zip(model_names, w)}),
             }
         )
+        if progress and (idx % 250 == 0 or idx == total_coarse):
+            elapsed = time.time() - t_coarse
+            eta = (elapsed / max(idx, 1)) * max(0, total_coarse - idx)
+            progress.log(
+                f"Blend {blend_name}: coarse {idx}/{total_coarse} "
+                f"best={coarse_best:.6f} eta~{format_seconds(eta)}"
+            )
 
     coarse.sort(key=lambda x: x[1])
     top = coarse[:20]
@@ -668,7 +819,10 @@ def fit_blend(
     best_w = top[0][0]
     best_s = blend_score(preds, best_w, y)
 
-    for w, _ in top:
+    if progress:
+        progress.log(f"Blend {blend_name}: fine search on top {len(top)} candidates")
+
+    for k, (w, _) in enumerate(top, start=1):
         tuned_w, tuned_s = fine_tune_weights(preds, y, w, step=0.01, max_rounds=30)
         records.append(
             {
@@ -680,6 +834,8 @@ def fit_blend(
         )
         if tuned_s < best_s:
             best_w, best_s = tuned_w, tuned_s
+        if progress and (k % 5 == 0 or k == len(top)):
+            progress.log(f"Blend {blend_name}: fine {k}/{len(top)} current_best={best_s:.6f}")
 
     records.append(
         {
@@ -689,6 +845,9 @@ def fit_blend(
             "weights_json": json.dumps({m: float(x) for m, x in zip(model_names, best_w)}),
         }
     )
+
+    if progress:
+        progress.log(f"Blend {blend_name}: selected score={best_s:.6f}")
 
     return best_w, best_s, pd.DataFrame(records)
 
@@ -737,10 +896,12 @@ def train_full_models(
     test_blocks: Dict[str, pd.DataFrame],
     results: Dict[str, ModelResult],
     seed: int,
+    progress: Optional[ProgressLogger] = None,
 ) -> Dict[str, np.ndarray]:
     preds: Dict[str, np.ndarray] = {}
 
     if "M1_ridge_a" in admitted_models:
+        t0 = time.time()
         m1 = Pipeline(
             steps=[
                 ("scaler", StandardScaler()),
@@ -751,9 +912,12 @@ def train_full_models(
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=RuntimeWarning)
             m1.fit(bundle.block_a_sanitized, np.log1p(bundle.y), ridge__sample_weight=sw)
-            preds["M1_ridge_a"] = np.maximum(np.expm1(m1.predict(test_blocks["A"])), 1e-6)
+            preds["M1_ridge_a"] = expm1_safe(m1.predict(test_blocks["A"]))
+        if progress:
+            progress.log(f"Full fit M1_ridge_a done in {format_seconds(time.time() - t0)}")
 
     if "M2_ridge_b" in admitted_models:
+        t0 = time.time()
         m2 = Pipeline(
             steps=[
                 ("scaler", StandardScaler()),
@@ -764,31 +928,40 @@ def train_full_models(
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=RuntimeWarning)
             m2.fit(bundle.block_b_sanitized, np.log1p(bundle.y), ridge__sample_weight=sw)
-            preds["M2_ridge_b"] = np.maximum(np.expm1(m2.predict(test_blocks["B"])), 1e-6)
+            preds["M2_ridge_b"] = expm1_safe(m2.predict(test_blocks["B"]))
+        if progress:
+            progress.log(f"Full fit M2_ridge_b done in {format_seconds(time.time() - t0)}")
 
     if "M3_lgbm_l1" in admitted_models:
         import lightgbm as lgb
 
+        t0 = time.time()
         base = results["M3_lgbm_l1"].params.copy()
         n_est = int(np.median(results["M3_lgbm_l1"].best_iterations)) if results["M3_lgbm_l1"].best_iterations else 800
         base["n_estimators"] = max(100, n_est)
         model = lgb.LGBMRegressor(**base)
         model.fit(bundle.block_c_sanitized, np.log1p(bundle.y))
-        preds["M3_lgbm_l1"] = np.maximum(np.expm1(model.predict(test_blocks["C"])), 1e-6)
+        preds["M3_lgbm_l1"] = expm1_safe(model.predict(test_blocks["C"]))
+        if progress:
+            progress.log(f"Full fit M3_lgbm_l1 done in {format_seconds(time.time() - t0)}")
 
     if "M4_xgb" in admitted_models:
         import xgboost as xgb
 
+        t0 = time.time()
         params = results["M4_xgb"].params.copy()
         n_boost = int(np.median(results["M4_xgb"].best_iterations)) if results["M4_xgb"].best_iterations else 600
         dtr = xgb.DMatrix(bundle.block_c_sanitized, label=np.log1p(bundle.y))
         dte = xgb.DMatrix(test_blocks["C"])
         model = xgb.train(params, dtr, num_boost_round=max(100, n_boost), verbose_eval=False)
-        preds["M4_xgb"] = np.maximum(np.expm1(model.predict(dte)), 1e-6)
+        preds["M4_xgb"] = expm1_safe(model.predict(dte))
+        if progress:
+            progress.log(f"Full fit M4_xgb done in {format_seconds(time.time() - t0)}")
 
     if "M5_cat" in admitted_models:
         from catboost import CatBoostRegressor
 
+        t0 = time.time()
         params = results["M5_cat"].params.copy()
         n_est = int(np.median(results["M5_cat"].best_iterations)) if results["M5_cat"].best_iterations else 400
         params["iterations"] = max(100, n_est)
@@ -796,7 +969,9 @@ def train_full_models(
         cat_cols = [c for c in ["date", "product_id"] if c in bundle.cat_block.columns]
         model = CatBoostRegressor(**params)
         model.fit(bundle.cat_block, bundle.y, cat_features=cat_cols)
-        preds["M5_cat"] = np.maximum(model.predict(test_blocks["CAT"]), 1e-6)
+        preds["M5_cat"] = stabilize_pred(model.predict(test_blocks["CAT"]))
+        if progress:
+            progress.log(f"Full fit M5_cat done in {format_seconds(time.time() - t0)}")
 
     return preds
 
@@ -807,9 +982,11 @@ def save_submission_pair(
     semicolon_path: Path,
     comma_path: Path,
 ) -> None:
-    df = pd.DataFrame({"ID": ids, "TARGET": np.maximum(pred, 1e-6)})
+    df = pd.DataFrame({"ID": ids, "TARGET": stabilize_pred(pred)})
     if not df["TARGET"].notna().all():
         raise ValueError("Submission contains NaN")
+    if not np.isfinite(df["TARGET"].values).all():
+        raise ValueError("Submission contains non-finite values")
     if not (df["TARGET"] > 0).all():
         raise ValueError("Submission contains non-positive values")
 
@@ -824,12 +1001,25 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, object]:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     start_ts = time.time()
+    progress = ProgressLogger(run_start_ts=start_ts, time_budget_min=args.time_budget_min, enabled=True)
+
+    progress.log(
+        f"Run start: stage={args.stage} n_splits={args.n_splits} "
+        f"time_budget_min={args.time_budget_min} seed={args.seed} "
+        f"use_transductive={args.use_transductive}"
+    )
+    progress.log(f"Artifacts dir: {run_dir}")
 
     if args.stage == "baseline":
         args.max_submit_pack = min(int(args.max_submit_pack), 1)
 
     bundle = build_data_bundle(base_dir=base_dir, use_transductive=args.use_transductive)
     test_blocks = get_test_blocks(bundle, use_transductive=args.use_transductive)
+    progress.log(
+        f"Data loaded: train_rows={len(bundle.train_df)} test_rows={len(bundle.test_df)} "
+        f"features(A/B/C)={bundle.block_a_sanitized.shape[1]}/"
+        f"{bundle.block_b_sanitized.shape[1]}/{bundle.block_c_sanitized.shape[1]}"
+    )
 
     if len(bundle.test_ids) != len(test_blocks["A"]):
         raise ValueError("Test feature row count mismatch")
@@ -848,12 +1038,14 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, object]:
         n_splits=args.n_splits,
         seed=args.seed,
         alpha=10.0,
+        progress=progress,
     )
     results[m1.name] = m1
     for fold_idx, score in enumerate(m1.fold_mapes):
         cv_records.append({"model": m1.name, "fold": fold_idx, "mape": score, "rows": int(len(folds[fold_idx][1]))})
 
     baseline_mape = m1.mean_mape
+    progress.log(f"Baseline MAPE ({m1.name}) = {baseline_mape:.6f}")
 
     if args.stage in {"baseline"}:
         admitted = ["M1_ridge_a"]
@@ -866,6 +1058,7 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, object]:
             n_splits=args.n_splits,
             seed=args.seed,
             alpha=10.0,
+            progress=progress,
         )
         results[m2.name] = m2
         for fold_idx, score in enumerate(m2.fold_mapes):
@@ -881,10 +1074,13 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, object]:
                 groups=bundle.groups,
                 n_splits=args.n_splits,
                 seed=args.seed,
+                progress=progress,
             )
             results[m3.name] = m3
             for fold_idx, score in enumerate(m3.fold_mapes):
                 cv_records.append({"model": m3.name, "fold": fold_idx, "mape": score, "rows": int(len(folds[fold_idx][1]))})
+        else:
+            progress.log(f"Skip M3_lgbm_l1 due to remaining budget ({remaining_min:.1f}m <= 20m)")
 
         elapsed_min = (time.time() - start_ts) / 60.0
         remaining_min = args.time_budget_min - elapsed_min
@@ -897,12 +1093,15 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, object]:
                     groups=bundle.groups,
                     n_splits=args.n_splits,
                     seed=args.seed,
+                    progress=progress,
                 )
                 results[m4.name] = m4
                 for fold_idx, score in enumerate(m4.fold_mapes):
                     cv_records.append({"model": m4.name, "fold": fold_idx, "mape": score, "rows": int(len(folds[fold_idx][1]))})
             except Exception as exc:  # pragma: no cover
                 print(f"[warn] Skipping XGBoost due to error: {exc}")
+        else:
+            progress.log(f"Skip M4_xgb due to remaining budget ({remaining_min:.1f}m <= 30m)")
 
         elapsed_min = (time.time() - start_ts) / 60.0
         remaining_min = args.time_budget_min - elapsed_min
@@ -915,12 +1114,15 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, object]:
                     groups=bundle.groups,
                     n_splits=args.n_splits,
                     seed=args.seed,
+                    progress=progress,
                 )
                 results[m5.name] = m5
                 for fold_idx, score in enumerate(m5.fold_mapes):
                     cv_records.append({"model": m5.name, "fold": fold_idx, "mape": score, "rows": int(len(folds[fold_idx][1]))})
             except Exception as exc:  # pragma: no cover
                 print(f"[warn] Skipping CatBoost due to error: {exc}")
+        else:
+            progress.log(f"Skip M5_cat due to remaining budget ({remaining_min:.1f}m <= 30m)")
 
         admitted = ["M1_ridge_a"]
         admitted_oof = {"M1_ridge_a": results["M1_ridge_a"].oof_pred}
@@ -929,6 +1131,7 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, object]:
         for model_name in ["M2_ridge_b", "M3_lgbm_l1", "M4_xgb", "M5_cat"]:
             if model_name not in results:
                 gate_rows.append({"model": model_name, "available": False, "accepted": False, "reason": "not_trained"})
+                progress.log(f"Gating {model_name}: not trained")
                 continue
 
             res = results[model_name]
@@ -949,6 +1152,7 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, object]:
                     "reason": reason,
                 }
             )
+            progress.log(f"Gating {model_name}: accepted={accept} ({reason})")
 
         pd.DataFrame(gate_rows).to_csv(run_dir / "gating.csv", index=False)
 
@@ -981,6 +1185,7 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, object]:
         json.dump(registry, f, indent=2)
 
     oof_frame.to_parquet(run_dir / "oof_predictions.parquet", index=False)
+    progress.log("Saved training artifacts: cv_scores.csv, model_registry.json, oof_predictions.parquet")
 
     # Early return for train stage.
     if args.stage == "train":
@@ -999,18 +1204,22 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, object]:
     lgb_models = [m for m in ["M1_ridge_a", "M2_ridge_b", "M3_lgbm_l1"] if m in admitted]
     full_models = admitted.copy()
 
-    w_linear, s_linear, df_linear = fit_blend("linear", linear_models, oof_dict, bundle.y, args.seed)
+    w_linear, s_linear, df_linear = fit_blend("linear", linear_models, oof_dict, bundle.y, args.seed, progress=progress)
     blend_rows.append(df_linear)
 
-    w_lgb, s_lgb, df_lgb = fit_blend("linear_lgb", lgb_models, oof_dict, bundle.y, args.seed)
+    w_lgb, s_lgb, df_lgb = fit_blend("linear_lgb", lgb_models, oof_dict, bundle.y, args.seed, progress=progress)
     blend_rows.append(df_lgb)
 
-    w_full, s_full, df_full = fit_blend("full", full_models, oof_dict, bundle.y, args.seed)
+    w_full, s_full, df_full = fit_blend("full", full_models, oof_dict, bundle.y, args.seed, progress=progress)
     blend_rows.append(df_full)
 
-    full_blend_oof = np.column_stack([oof_dict[m] for m in full_models]) @ w_full
+    full_blend_oof = stabilize_pred(np.column_stack([oof_dict[m] for m in full_models]) @ w_full)
     cal_cfg, cal_score, cal_oof = calibrate_predictions(bundle.y, full_blend_oof)
     use_calibration = cal_score + 1e-12 < s_full
+    progress.log(
+        f"Calibration check: base={s_full:.6f} calibrated={cal_score:.6f} "
+        f"use_calibration={use_calibration}"
+    )
 
     blend_rows.append(
         pd.DataFrame(
@@ -1027,6 +1236,7 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, object]:
 
     blend_df = pd.concat(blend_rows, ignore_index=True)
     blend_df.to_csv(run_dir / "blend_search.csv", index=False)
+    progress.log("Saved blend_search.csv")
 
     if args.stage == "blend":
         return {
@@ -1041,7 +1251,8 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, object]:
         }
 
     # Submit pack / full.
-    test_preds = train_full_models(admitted, bundle, test_blocks, results, args.seed)
+    progress.log(f"Training full models for admitted set: {admitted}")
+    test_preds = train_full_models(admitted, bundle, test_blocks, results, args.seed, progress=progress)
 
     # Build submission variants.
     variants: List[Tuple[str, np.ndarray, str]] = []
@@ -1051,13 +1262,13 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, object]:
         raise ValueError("Anchor model prediction missing")
     variants.append(("v1_anchor_linear", v1, "Anchor weighted Ridge on Block A"))
 
-    v2 = np.column_stack([test_preds[m] for m in linear_models]) @ w_linear
+    v2 = stabilize_pred(np.column_stack([test_preds[m] for m in linear_models]) @ w_linear)
     variants.append(("v2_linear_blend", v2, "Blend of admitted linear models"))
 
-    v3 = np.column_stack([test_preds[m] for m in lgb_models]) @ w_lgb
+    v3 = stabilize_pred(np.column_stack([test_preds[m] for m in lgb_models]) @ w_lgb)
     variants.append(("v3_linear_lgbm", v3, "Blend of linear + LGBM subset"))
 
-    v4 = np.column_stack([test_preds[m] for m in full_models]) @ w_full
+    v4 = stabilize_pred(np.column_stack([test_preds[m] for m in full_models]) @ w_full)
     variants.append(("v4_full_ensemble", v4, "Full admitted-model blend"))
 
     if use_calibration:
@@ -1080,6 +1291,7 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, object]:
         semicolon_path = submissions_dir / f"{stamp}_{name}.csv"
         comma_path = submissions_dir / f"{stamp}_{name}_comma.csv"
         save_submission_pair(bundle.test_ids, pred, semicolon_path, comma_path)
+        progress.log(f"Wrote submission variant {name} -> {semicolon_path.name}")
 
         manifest_rows.append(
             {
@@ -1102,6 +1314,7 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, object]:
 
     manifest = pd.DataFrame(manifest_rows)
     manifest.to_csv(run_dir / "submission_manifest.csv", index=False)
+    progress.log("Saved submission_manifest.csv")
 
     # Add recommended probing order for stage=full.
     if args.stage == "full":
@@ -1115,6 +1328,9 @@ def run_pipeline(args: argparse.Namespace) -> Dict[str, object]:
             rec["probe_order"] = rank
             probe_rows.append(rec)
         pd.DataFrame(probe_rows).to_csv(run_dir / "probing_plan.csv", index=False)
+        progress.log("Saved probing_plan.csv")
+
+    progress.log(f"Run finished in {format_seconds(progress.elapsed_sec())}")
 
     return {
         "run_dir": run_dir,
